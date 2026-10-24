@@ -49,6 +49,7 @@ conn.execute('CREATE TABLE IF NOT EXISTS store_observations (retailer TEXT, prod
 conn.execute('CREATE TABLE IF NOT EXISTS user_zips (guild_id INTEGER, user_id INTEGER, zip_code TEXT, PRIMARY KEY(guild_id,user_id))')
 conn.execute('CREATE TABLE IF NOT EXISTS rss_seen (url TEXT PRIMARY KEY, first_seen TEXT)')
 conn.execute('CREATE TABLE IF NOT EXISTS alert_events (scope TEXT, retailer TEXT, product_id TEXT, store_id TEXT, price TEXT, coupon TEXT, availability TEXT, PRIMARY KEY(scope,retailer,product_id,store_id,price,coupon,availability))')
+conn.execute('CREATE TABLE IF NOT EXISTS osm_store_watches (guild_id INTEGER, user_id INTEGER, osm_key TEXT, label TEXT, address TEXT, PRIMARY KEY(guild_id,user_id,osm_key))')
 conn.commit()
 lock = asyncio.Lock()
 
@@ -134,6 +135,33 @@ async def zip_coordinates(zip_code):
         obj=res.json(); places=obj.get('places') or []
         if not places: return None
         return float(places[0]['latitude']),float(places[0]['longitude'])
+
+# Public OpenStreetMap POI discovery, not an official Walmart directory.
+# Do not treat OSM element identifiers as Walmart store numbers.
+OSM_DISCOVERY = os.getenv('OSM_STORE_DISCOVERY', 'true').lower() == 'true'
+OSM_ENDPOINT = 'https://overpass.kumi.systems/api/interpreter'
+
+async def discover_osm_walmarts(lat, lon, radius_miles):
+    if not OSM_DISCOVERY: return [], 'disabled'
+    radius_m = min(100, max(1, radius_miles)) * 1609.344
+    query = f'[out:json][timeout:20];(nwr(around:{radius_m:.0f},{lat:.6f},{lon:.6f})[shop=supermarket][name~"Walmart",i];nwr(around:{radius_m:.0f},{lat:.6f},{lon:.6f})[brand~"Walmart",i];);out center 100;'
+    async with httpx.AsyncClient(timeout=28,follow_redirects=False,headers={'User-Agent':'DealHunter/5.0 (Discord store finder; contact your server administrator)'}) as client:
+        res = await client.post(OSM_ENDPOINT, data={'data':query})
+        res.raise_for_status()
+        elements = res.json().get('elements',[])
+    found=[]
+    for e in elements:
+        tags=e.get('tags') or {}
+        if 'walmart' not in (tags.get('name','')+' '+tags.get('brand','')).lower(): continue
+        pt=e.get('center') or e
+        if not isinstance(pt.get('lat'),(int,float)) or not isinstance(pt.get('lon'),(int,float)): continue
+        key=f"{e.get('type','')}:{e.get('id','')}"
+        if not re.fullmatch(r'(node|way|relation):\d+',key): continue
+        addr=' '.join(filter(None,[tags.get('addr:housenumber',''),tags.get('addr:street','')])).strip()
+        if tags.get('addr:city'): addr += (', ' if addr else '')+tags['addr:city']
+        dist=distance_miles(lat,lon,float(pt['lat']),float(pt['lon']))
+        if dist<=radius_miles:found.append((dist,key,tags.get('name','Walmart')[:80],addr[:120]))
+    return sorted(found), 'openstreetmap'
 
 def categorize_lead(title, description, link):
     """Conservative, text-based categories; never claim price verification."""
@@ -351,23 +379,52 @@ async def findstores(interaction:discord.Interaction,zip_code:str='',radius_mile
     if not re.fullmatch(r'\d{5}',zip_code):
         await interaction.response.send_message('Use /setzip first, or supply a five-digit ZIP.',ephemeral=True);return
     await interaction.response.defer(ephemeral=True)
-    stores=load_store_directory()
-    if not stores:
-        await interaction.followup.send('No Walmart store directory configured. Add a licensed/authorized walmart_stores.csv with store_id,name,address,zip,latitude,longitude.',ephemeral=True);return
     try: loc=await zip_coordinates(zip_code)
     except Exception: loc=None
     if not loc:
         await interaction.followup.send('ZIP lookup unavailable. Try again later or check ZIP_LOOKUP_ENABLED.',ephemeral=True);return
+    stores=load_store_directory()
     results=[]
     for store in stores:
         try: dist=distance_miles(*loc,float(store['latitude']),float(store['longitude']))
         except (ValueError,KeyError):continue
-        if dist<=radius_miles:results.append((dist,store))
+        if dist<=radius_miles: results.append((dist,store))
     results.sort(key=lambda x:x[0])
-    if not results:
-        await interaction.followup.send('No stores in the configured directory within that radius.',ephemeral=True);return
-    lines=[f"#{r['store_id']} — {r.get('name','Walmart')} · {dist:.1f} mi · {r.get('address','')}" for dist,r in results[:15]]
-    await interaction.followup.send('Nearby stores (directory data, not live inventory):\n'+'\n'.join(lines)[:1700]+'\nUse /watchstore to follow a store.',ephemeral=True)
+    if results:
+        lines=[f"#{r['store_id']} — {r.get('name','Walmart')} · {dist:.1f} mi · {r.get('address','')}" for dist,r in results[:15]]
+        await interaction.followup.send('Nearby stores from configured CSV (not live inventory):\n'+'\n'.join(lines)[:1700]+'\nUse /watchstore for provider-reported store prices.',ephemeral=True)
+        return
+    try:
+        found, source = await discover_osm_walmarts(*loc,radius_miles)
+    except Exception:
+        logging.exception('OpenStreetMap lookup failed')
+        await interaction.followup.send('Store lookup temporarily unavailable. OpenStreetMap may be rate-limiting requests. Try again later or supply an authorized store CSV.',ephemeral=True)
+        return
+    if not found:
+        await interaction.followup.send('No Walmart locations found in available OpenStreetMap data within that radius. Results may be incomplete.',ephemeral=True)
+        return
+    lines=[f'{key} — {name} · {dist:.1f} mi · {address}' for dist,key,name,address in found[:12]]
+    await interaction.followup.send(('Nearby Walmart locations (community OpenStreetMap data; NOT store numbers, prices or stock):\n'+'\n'.join(lines)+'\nUse /watchlocation with the node:/way:/relation: ID.').strip()[:1900],ephemeral=True)
+
+@bot.tree.command(name='watchlocation',description='Follow a Walmart location found using /findstores (personal watchlist)')
+@app_commands.describe(location_id='OpenStreetMap ID such as node:12345',label='Optional short label')
+async def watchlocation(interaction:discord.Interaction,location_id:str,label:str=''):
+    if not re.fullmatch(r'(node|way|relation):\d{1,20}',location_id):
+        await interaction.response.send_message('Enter an OpenStreetMap location ID from /findstores, e.g. node:12345.',ephemeral=True);return
+    conn.execute('INSERT OR REPLACE INTO osm_store_watches VALUES (?,?,?,?,?)',(interaction.guild_id or 0,interaction.user.id,location_id,label[:80] or 'Walmart location',''))
+    conn.commit()
+    await interaction.response.send_message('Saved location '+location_id+'. This follows the location only; live price/inventory alerts require a separately verified provider store number.',ephemeral=True)
+
+@bot.tree.command(name='mywalmartlocations',description='List your selected Walmart locations')
+async def mywalmartlocations(interaction:discord.Interaction):
+    rows=conn.execute('SELECT osm_key,label FROM osm_store_watches WHERE guild_id=? AND user_id=? ORDER BY osm_key LIMIT 30',(interaction.guild_id or 0,interaction.user.id)).fetchall()
+    await interaction.response.send_message('\n'.join(f'{key} — {label}' for key,label in rows) if rows else 'No personal locations saved. Use /findstores then /watchlocation.',ephemeral=True)
+
+@bot.tree.command(name='unwatchlocation',description='Remove a location from your personal watchlist')
+async def unwatchlocation(interaction:discord.Interaction,location_id:str):
+    conn.execute('DELETE FROM osm_store_watches WHERE guild_id=? AND user_id=? AND osm_key=?',(interaction.guild_id or 0,interaction.user.id,location_id))
+    conn.commit()
+    await interaction.response.send_message('Removed '+location_id+' from your personal location watchlist.',ephemeral=True)
 
 @bot.tree.command(name='mystores',description='List the Walmart stores watched by this server')
 async def mystores(interaction:discord.Interaction):
@@ -375,6 +432,7 @@ async def mystores(interaction:discord.Interaction):
     await interaction.response.send_message('\n'.join(f'#{sid} {name}' for sid,name in rows) if rows else 'No watched stores.',ephemeral=True)
 
 async def main():
+    await bot.load_extension('gardener')
     if not TOKEN: raise RuntimeError('Set DISCORD_TOKEN in .env')
     async with bot:
         if GUILD_ID:
