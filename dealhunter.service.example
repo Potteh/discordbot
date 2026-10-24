@@ -1,0 +1,13 @@
+[Unit]
+Description=DealHunter Discord Bot
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/dealhunter
+ExecStart=/opt/dealhunter/.venv/bin/python /opt/dealhunter/bot.py
+Restart=on-failure
+RestartSec=10
+[Install]
+WantedBy=multi-user.target
