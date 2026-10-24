@@ -6,6 +6,11 @@ import sqlite3
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse
+import csv
+import re
+import math
+import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import discord
 import httpx
@@ -25,11 +30,16 @@ DB = os.getenv('DATABASE_PATH', 'deals.sqlite3')
 FEED = os.getenv('DEAL_FEED_URL', '')
 BEARER = os.getenv('DEAL_FEED_BEARER_TOKEN', '')
 MAX_AGE = max(1, int(os.getenv('MAX_OBSERVATION_AGE_MINUTES', '120')))
+RSS_URLS = [x.strip() for x in os.getenv('RSS_FEED_URLS','').split(',') if x.strip()]
+STORE_DIRECTORY = os.getenv('WALMART_STORES_CSV', 'walmart_stores.csv')
+ZIP_LOOKUP_ENABLED = os.getenv('ZIP_LOOKUP_ENABLED','true').lower() == 'true'
 conn = sqlite3.connect(DB)
 conn.execute('CREATE TABLE IF NOT EXISTS observations (retailer TEXT, product_id TEXT, title TEXT, price TEXT, regular TEXT, coupon TEXT, url TEXT, observed_at TEXT)')
 conn.execute('CREATE TABLE IF NOT EXISTS alerts (retailer TEXT, product_id TEXT, price TEXT, coupon TEXT, PRIMARY KEY (retailer, product_id, price, coupon))')
 conn.execute('CREATE TABLE IF NOT EXISTS store_watches (guild_id INTEGER, store_id TEXT, store_name TEXT, PRIMARY KEY(guild_id,store_id))')
 conn.execute('CREATE TABLE IF NOT EXISTS store_observations (retailer TEXT, product_id TEXT, store_id TEXT, title TEXT, price TEXT, regular TEXT, coupon TEXT, availability TEXT, quantity INTEGER, verified_at TEXT, observed_at TEXT, source TEXT, PRIMARY KEY(retailer,product_id,store_id,observed_at))')
+conn.execute('CREATE TABLE IF NOT EXISTS user_zips (guild_id INTEGER, user_id INTEGER, zip_code TEXT, PRIMARY KEY(guild_id,user_id))')
+conn.execute('CREATE TABLE IF NOT EXISTS rss_seen (url TEXT PRIMARY KEY, first_seen TEXT)')
 conn.execute('CREATE TABLE IF NOT EXISTS alert_events (scope TEXT, retailer TEXT, product_id TEXT, store_id TEXT, price TEXT, coupon TEXT, availability TEXT, PRIMARY KEY(scope,retailer,product_id,store_id,price,coupon,availability))')
 conn.commit()
 lock = asyncio.Lock()
@@ -96,6 +106,67 @@ async def fetch_deals():
     if not isinstance(data,list): raise ValueError('Feed must be a JSON array or {"deals": [...]}')
     return [x for raw in data[:2000] if (x:=normalize(raw))]
 
+def load_store_directory():
+    path = Path(STORE_DIRECTORY)
+    if not path.is_file(): return []
+    with path.open(newline='',encoding='utf-8-sig') as f:
+        return [row for row in csv.DictReader(f) if row.get('store_id','').isdigit() and row.get('latitude') and row.get('longitude')]
+
+def distance_miles(a,b,c,d):
+    a,b,c,d=map(math.radians,(a,b,c,d))
+    x=math.sin((c-a)/2)**2+math.cos(a)*math.cos(c)*math.sin((d-b)/2)**2
+    return 3958.8*2*math.asin(min(1,math.sqrt(x)))
+
+async def zip_coordinates(zip_code):
+    if not re.fullmatch(r'\d{5}',zip_code): return None
+    if not ZIP_LOOKUP_ENABLED: return None
+    async with httpx.AsyncClient(timeout=12,follow_redirects=False) as client:
+        res=await client.get(f'https://api.zippopotam.us/us/{zip_code}')
+        if res.status_code != 200: return None
+        obj=res.json(); places=obj.get('places') or []
+        if not places: return None
+        return float(places[0]['latitude']),float(places[0]['longitude'])
+
+async def scan_rss():
+    # RSS is discovery of third-party deal *leads*, not verified price or inventory.
+    # Only configured HTTPS URLs are read; no retailer scraping.
+    if not RSS_URLS or not CHANNEL_ID: return (0,0)
+    channel=bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
+    inspected=posted=0
+    async with httpx.AsyncClient(timeout=20,follow_redirects=False,headers={'User-Agent':'DealHunter/3.0 (RSS reader)'}) as client:
+        for url in RSS_URLS:
+            parsed=urlparse(url)
+            if parsed.scheme!='https' or not parsed.hostname: continue
+            try:
+                response=await client.get(url);response.raise_for_status()
+                if len(response.content)>2_000_000: continue
+                root=ET.fromstring(response.content)
+                entries=root.findall('.//item')
+                if not entries:
+                    entries=root.findall('{http://www.w3.org/2005/Atom}entry')
+                for entry in entries[:75]:
+                    def val(tag):
+                        node=entry.find(tag)
+                        return (node.text or '').strip() if node is not None else ''
+                    title=val('title') or val('{http://www.w3.org/2005/Atom}title')
+                    link=val('link')
+                    if not link:
+                        el=entry.find('{http://www.w3.org/2005/Atom}link')
+                        link=el.get('href','') if el is not None else ''
+                    if not title or not link or urlparse(link).scheme!='https': continue
+                    inspected+=1
+                    content=(title+' '+val('description')).lower()
+                    if not any(word in content for word in ('amazon','walmart','coupon','clearance','penny deal','price error')): continue
+                    if conn.execute('SELECT 1 FROM rss_seen WHERE url=?',(link,)).fetchone():continue
+                    embed=discord.Embed(title=title[:240],url=link,description='Community deal lead — price, stock, coupons, and store availability are **unverified**.',color=discord.Color.orange())
+                    embed.set_footer(text='Third-party RSS lead; verify on retailer site before purchasing. Not a confirmed price error.')
+                    await channel.send(embed=embed)
+                    conn.execute('INSERT OR IGNORE INTO rss_seen VALUES (?,?)',(link,datetime.now(timezone.utc).isoformat()))
+                    posted+=1
+                conn.commit()
+            except Exception: logging.exception('RSS source failed: %s',urlparse(url).hostname)
+    return inspected,posted
+
 intents=discord.Intents.default()
 bot=commands.Bot(command_prefix='!',intents=intents)
 
@@ -145,9 +216,12 @@ async def scan():
 
 @tasks.loop(minutes=INTERVAL)
 async def periodic_scan():
-    if not CHANNEL_ID or not FEED: return
+    if not CHANNEL_ID or not (FEED or RSS_URLS): return
     try:
-        n,s=await scan(); logging.info('Scanned %d deals, sent %d alerts',n,s)
+        n=s=0
+        if FEED: n,s=await scan()
+        rn,rs=await scan_rss()
+        logging.info('Scanned %d structured observations and %d RSS leads; posted %d alerts',n,rn,s+rs)
     except Exception: logging.exception('Periodic scan failed')
 
 @periodic_scan.before_loop
@@ -156,24 +230,27 @@ async def before_scan(): await bot.wait_until_ready()
 @bot.event
 async def on_ready():
     if not periodic_scan.is_running(): periodic_scan.start()
-    logging.info('Logged in as %s; feed configured=%s',bot.user,bool(FEED))
+    logging.info('Logged in as %s; structured feed=%s; RSS sources=%d',bot.user,bool(FEED),len(RSS_URLS))
 
 @bot.tree.command(name='dealstatus',description='Show DealHunter monitoring status')
 async def dealstatus(interaction:discord.Interaction):
     n=conn.execute('SELECT COUNT(*) FROM observations').fetchone()[0]
     sn=conn.execute('SELECT COUNT(*) FROM store_observations').fetchone()[0]
     watches=conn.execute('SELECT COUNT(*) FROM store_watches WHERE guild_id=?',(interaction.guild_id or 0,)).fetchone()[0]
-    await interaction.response.send_message(f'Feed configured: {bool(FEED)} | Scan interval: {INTERVAL} min | Online observations: {n} | Store observations: {sn} | Watched stores: {watches} | Discount threshold: {THRESHOLD}%',ephemeral=True)
+    await interaction.response.send_message(f'Structured feed: {bool(FEED)} | RSS sources: {len(RSS_URLS)} | Scan interval: {INTERVAL} min | Online observations: {n} | Store observations: {sn} | Watched stores: {watches} | Discount threshold: {THRESHOLD}%',ephemeral=True)
 
 @bot.tree.command(name='dealscan',description='Run an immediate deal scan (Manage Server permission)')
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 async def dealscan(interaction:discord.Interaction):
-    if not FEED or not CHANNEL_ID:
-        await interaction.response.send_message('Set DEAL_FEED_URL and DEALS_CHANNEL_ID first.',ephemeral=True);return
+    if not (FEED or RSS_URLS) or not CHANNEL_ID:
+        await interaction.response.send_message('Configure RSS_FEED_URLS or DEAL_FEED_URL and DEALS_CHANNEL_ID first.',ephemeral=True);return
     await interaction.response.defer(ephemeral=True)
     try:
-        n,s=await scan(); await interaction.followup.send(f'Scanned {n} observations; posted {s} alerts.',ephemeral=True)
+        n=s=0
+        if FEED: n,s=await scan()
+        rn,rs=await scan_rss()
+        await interaction.followup.send(f'Scanned {n} structured observations and {rn} RSS leads; posted {s+rs} alerts.',ephemeral=True)
     except Exception as e:
         logging.exception('Manual scan failed');await interaction.followup.send(f'Scan failed: {type(e).__name__}. See logs.',ephemeral=True)
 
@@ -213,12 +290,56 @@ async def pricehistory(interaction:discord.Interaction,retailer:str,product_id:s
         lines=[f'${p} · observed {t}' for p,t in rows]
     await interaction.response.send_message('\n'.join(lines)[:1900] if lines else 'No observations found.',ephemeral=True)
 
+@bot.tree.command(name='setzip',description='Save your ZIP code for Walmart store lookup')
+@app_commands.describe(zip_code='Five-digit US ZIP code')
+async def setzip(interaction:discord.Interaction,zip_code:str):
+    if not re.fullmatch(r'\d{5}',zip_code):
+        await interaction.response.send_message('Enter a five-digit US ZIP code.',ephemeral=True);return
+    conn.execute('INSERT OR REPLACE INTO user_zips VALUES (?,?,?)',(interaction.guild_id or 0,interaction.user.id,zip_code));conn.commit()
+    await interaction.response.send_message(f'ZIP set to {zip_code}. Use /findstores to look for stores in the configured directory.',ephemeral=True)
+
+@bot.tree.command(name='findstores',description='Find Walmart stores near a ZIP from the configured store directory')
+@app_commands.describe(zip_code='Optional ZIP (defaults to your saved ZIP)',radius_miles='Search radius in miles (1–100)')
+async def findstores(interaction:discord.Interaction,zip_code:str='',radius_miles:int=25):
+    if not 1<=radius_miles<=100:
+        await interaction.response.send_message('Radius must be 1–100 miles.',ephemeral=True);return
+    if not zip_code:
+        row=conn.execute('SELECT zip_code FROM user_zips WHERE guild_id=? AND user_id=?',(interaction.guild_id or 0,interaction.user.id)).fetchone()
+        zip_code=row[0] if row else ''
+    if not re.fullmatch(r'\d{5}',zip_code):
+        await interaction.response.send_message('Use /setzip first, or supply a five-digit ZIP.',ephemeral=True);return
+    await interaction.response.defer(ephemeral=True)
+    stores=load_store_directory()
+    if not stores:
+        await interaction.followup.send('No Walmart store directory configured. Add a licensed/authorized walmart_stores.csv with store_id,name,address,zip,latitude,longitude.',ephemeral=True);return
+    try: loc=await zip_coordinates(zip_code)
+    except Exception: loc=None
+    if not loc:
+        await interaction.followup.send('ZIP lookup unavailable. Try again later or check ZIP_LOOKUP_ENABLED.',ephemeral=True);return
+    results=[]
+    for store in stores:
+        try: dist=distance_miles(*loc,float(store['latitude']),float(store['longitude']))
+        except (ValueError,KeyError):continue
+        if dist<=radius_miles:results.append((dist,store))
+    results.sort(key=lambda x:x[0])
+    if not results:
+        await interaction.followup.send('No stores in the configured directory within that radius.',ephemeral=True);return
+    lines=[f"#{r['store_id']} — {r.get('name','Walmart')} · {dist:.1f} mi · {r.get('address','')}" for dist,r in results[:15]]
+    await interaction.followup.send('Nearby stores (directory data, not live inventory):\n'+'\n'.join(lines)[:1700]+'\nUse /watchstore to follow a store.',ephemeral=True)
+
+@bot.tree.command(name='mystores',description='List the Walmart stores watched by this server')
+async def mystores(interaction:discord.Interaction):
+    rows=conn.execute('SELECT store_id,store_name FROM store_watches WHERE guild_id=? ORDER BY store_id LIMIT 50',(interaction.guild_id or 0,)).fetchall()
+    await interaction.response.send_message('\n'.join(f'#{sid} {name}' for sid,name in rows) if rows else 'No watched stores.',ephemeral=True)
+
 async def main():
     if not TOKEN: raise RuntimeError('Set DISCORD_TOKEN in .env')
     async with bot:
         if GUILD_ID:
-            guild=discord.Object(id=GUILD_ID);bot.tree.copy_global_to(guild=guild);await bot.tree.sync(guild=guild)
-        else: await bot.tree.sync()
-        await bot.start(TOKEN)
+            guild=discord.Object(id=GUILD_ID);bot.tree.copy_global_to(guild=guild);await bot.login(TOKEN);await bot.tree.sync(guild=guild)
+        else:
+            await bot.login(TOKEN)
+            await bot.tree.sync()
+        await bot.connect(reconnect=True)
 
 if __name__=='__main__': asyncio.run(main())

@@ -1,37 +1,34 @@
-# DealHunter Discord bot
+# DealHunter v3 — free-first, no required paid API
 
-A self-hosted Discord alerting bot for Amazon/Walmart deal observations. **This is a functional monitoring and alerting engine, not a turnkey retailer crawler.** It needs a legitimate authorized product/deal data feed. It does not scrape Amazon or Walmart, discover coupons itself, validate coupon eligibility, or verify in-store penny clearance.
+This version preserves the v2 SQLite schema and adds **optional public HTTPS RSS deal-lead ingestion** and **ZIP-code Walmart store selection** using an authorized store directory CSV. It does not scrape Amazon/Walmart, fabricate retailer prices, or claim to verify penny deals. RSS alerts are clearly labeled unverified leads. Real prices/inventory require an approved JSON data feed.
 
-## Setup on Ubuntu
+## Ubuntu upgrade
 
-1. Install Python 3.11+ and create a Discord application/bot at https://discord.com/developers/applications.
-2. Invite the bot with `bot` and `applications.commands` scopes; grant View Channel, Send Messages, Embed Links.
-3. `python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`
-4. `cp .env.example .env`, then edit `.env` to add bot token, server (guild) ID, channel ID, and your authorized `DEAL_FEED_URL`.
-5. `python bot.py`
+1. Back up `bot.py`, `.env`, and your SQLite database. **Keep your existing `.env` and database; do not overwrite them.**
+2. Stop the running bot (Ctrl+C or `sudo systemctl stop dealhunter`).
+3. Unzip the archive to a temporary directory and copy `bot.py` to your existing `/home/michael/dealhunter/discordbot/` directory. Copy `requirements.txt` too. The ZIP's `dealhunter/` folder contains the files.
+4. Ensure the database directory is writable (`mkdir -p data`). The existing database remains compatible.
+5. `cd /home/michael/dealhunter/discordbot && source .venv/bin/activate && python -m pip install -r requirements.txt`
+6. Add new optional variables from `.env.example` to your **existing** `.env`, notably `RSS_FEED_URLS`, `WALMART_STORES_CSV`, `ZIP_LOOKUP_ENABLED`.
+7. `python bot.py`. Test `/dealstatus`, `/setzip`, `/findstores`, `/mystores`.
 
-## Feed contract
+## Free data feeds
 
-`GET DEAL_FEED_URL` must return a JSON array or `{"deals": [...]}`. Each record needs `retailer` (`amazon`/`walmart`), `product_id`, `title`, `price`, `url`; optional `regular_price`, `coupon_amount`. URLs must be HTTPS retailer product URLs. Prices are in USD. `coupon_amount` is a **flat dollar amount**, not a percent. The feed provider must independently establish that any coupon is available and applicable. Do not use sample_feed.json as real deal data.
+Add comma-separated HTTPS RSS URLs to `RSS_FEED_URLS=` only when you have permission to use them. The bot polls each feed, checks deal-related words, deduplicates links, and posts **unverified community leads** to `DEALS_CHANNEL_ID`. Feed availability, rate limits and terms vary; this bot does not include any guaranteed live feeds. An empty feed list means no automatic discovery.
 
-The engine calculates the estimated effective price and posts on price <= `MAX_PENNY_PRICE`, discount >= `MIN_DISCOUNT_PERCENT`, or coupon > 0 and total discount >= 40%. A discount is based on the supplied reference price, which may be inflated or stale. It deduplicates identical product/listed-price/coupon combinations in SQLite, records observations, and supports `/dealstatus` and admin-only `/dealscan`.
+## Walmart ZIP-based store discovery
 
-## Production limitations
+Populate `walmart_stores.csv` with `store_id,name,address,zip,latitude,longitude` rows obtained from a permitted/authorized directory. This ZIP includes only a blank CSV template; it does not ship with a current national Walmart store directory. `/setzip 32934` saves a user's ZIP. `/findstores` uses the free Zippopotam.us ZIP geocoding endpoint and computes approximate distance to stores in the CSV. `/watchstore` enables store-specific alerts **only if** an authorized structured provider supplies fresh verified-at price/stock observations. ZIP lookup sends the requested ZIP to Zippopotam.us; disable with `ZIP_LOOKUP_ENABLED=false`.
 
-No automatic source discovery or scraping is bundled. For real alerts, connect an appropriately licensed retailer API or authorized deal feed. Walmart store-specific penny clearance requires location-aware inventory/pricing data and cannot be verified by this bot. Coupons may require login, clipping, minimum spend, or eligibility; tax and shipping are excluded. SQLite access assumes one bot process. A restart preserves deduplication history. Alert changes are not edited or deleted when listings expire. Never expose the Discord token.
+## Scope and limits
 
-## Run as systemd
+- RSS discovery is not actual price verification; avoid calling RSS alerts confirmed errors or verified coupons.
+- The structured `DEAL_FEED_URL` is the same authorized JSON feed format as v2 and can report retailer-specific prices, coupons, inventory and verification timestamps.
+- `/watchstore` is currently a server-level watchlist, not an individual per-user DM subscription. `/setzip` is per-user. Nationwide RSS alerts are server-channel-wide.
+- No Amazon Keepa API or paid subscription is required to run the bot, but coverage depends entirely on your configured feeds.
+- Don't share Discord tokens or other API credentials. Rotate any previously exposed token.
+- Use a Discord bot account, not a user account/self-bot.
 
-Copy `dealhunter.service.example` and update `User`, `WorkingDirectory`, and `ExecStart` to your deployment paths. Then `sudo cp dealhunter.service.example /etc/systemd/system/dealhunter.service && sudo systemctl daemon-reload && sudo systemctl enable --now dealhunter`.
+## Security
 
-## Version 2: Walmart store monitoring
-
-The v2 database adds store watchlists, store observations, and scope-specific alert deduplication without deleting the original v1 tables. Run one bot process only. Backup `deals.sqlite3` before upgrading.
-
-New commands: `/watchstore store_id [store_name]` (admin), `/unwatchstore store_id` (admin), `/stores`, `/pricehistory retailer product_id [store_id]`. `/dealscan` and `/dealstatus` remain.
-
-To report an **online** listing, omit `scope` or set `scope: "online"`. To report a **Walmart store** listing, use `scope: "store"`, a numeric `store_id`, and optionally `store_name`, `availability` (`in_stock`, `limited`, `out_of_stock`, `unknown`), integer `quantity`, ISO 8601 UTC `verified_at`, and `source`. See `sample_store_feed.json` (illustrative, NOT real inventory). Store alerts require a watched store, a recent provider verification timestamp, a qualifying price, and availability not explicitly out of stock. Unknown inventory is clearly labeled as unknown; provider data is not independently verified by the bot. An observation timestamp alone does not establish inventory verification.
-
-**Data source limitations:** This package does not access Walmart internal store inventory, scan store shelves, guarantee penny clearance, or independently verify store prices or coupon stacking. Connect an authorized store-specific provider to `DEAL_FEED_URL`; if no provider offers this data, these features remain inactive. Online product data likewise requires a legitimate source. Prices, availability and coupons may vary by store, customer, time and checkout. `DEAL_FEED_URL` should be a trusted HTTPS endpoint; never configure it to an untrusted server because it receives your bearer token.
-
-**Deployment:** Stop the v1 service, back up the SQLite database, replace bot source and dependencies, update `.env` (including `MAX_OBSERVATION_AGE_MINUTES`), and restart the service. The bot needs Discord slash-command permissions. Store watches are guild-scoped but the configured alert channel is global; run one bot per Discord server to avoid cross-server alert routing.
+Do not commit `.env`, `*.sqlite3` or access tokens. RSS URLs should be trusted HTTPS sources; bot does not follow redirects. Test provider permissions and terms.
