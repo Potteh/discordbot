@@ -139,16 +139,29 @@ async def zip_coordinates(zip_code):
 # Public OpenStreetMap POI discovery, not an official Walmart directory.
 # Do not treat OSM element identifiers as Walmart store numbers.
 OSM_DISCOVERY = os.getenv('OSM_STORE_DISCOVERY', 'true').lower() == 'true'
-OSM_ENDPOINT = 'https://overpass.kumi.systems/api/interpreter'
+OSM_ENDPOINTS = [x.strip() for x in os.getenv('OSM_OVERPASS_ENDPOINTS', 'https://overpass.private.coffee/api/interpreter,https://overpass.kumi.systems/api/interpreter,https://overpass-api.de/api/interpreter').split(',') if x.strip().startswith('https://')]
 
 async def discover_osm_walmarts(lat, lon, radius_miles):
     if not OSM_DISCOVERY: return [], 'disabled'
     radius_m = min(100, max(1, radius_miles)) * 1609.344
     query = f'[out:json][timeout:20];(nwr(around:{radius_m:.0f},{lat:.6f},{lon:.6f})[shop=supermarket][name~"Walmart",i];nwr(around:{radius_m:.0f},{lat:.6f},{lon:.6f})[brand~"Walmart",i];);out center 100;'
-    async with httpx.AsyncClient(timeout=28,follow_redirects=False,headers={'User-Agent':'DealHunter/5.0 (Discord store finder; contact your server administrator)'}) as client:
-        res = await client.post(OSM_ENDPOINT, data={'data':query})
-        res.raise_for_status()
-        elements = res.json().get('elements',[])
+    elements = None
+    errors = []
+    # Each endpoint has a short bound; do not leave a Discord command spinning indefinitely.
+    for endpoint in OSM_ENDPOINTS:
+        try:
+            timeout = httpx.Timeout(11.0, connect=4.0)
+            async with httpx.AsyncClient(timeout=timeout,follow_redirects=False,headers={'User-Agent':'DealHunter/5.1 (community store lookup)'}) as client:
+                res = await client.post(endpoint, data={'data':query})
+                res.raise_for_status()
+                elements = res.json().get('elements', [])
+                if not isinstance(elements, list): raise ValueError('Invalid OSM response')
+                break
+        except (httpx.HTTPError, ValueError) as exc:
+            logging.warning('Overpass endpoint %s failed: %s', endpoint, exc)
+            errors.append(f'{endpoint}: {type(exc).__name__}')
+    if elements is None:
+        raise RuntimeError('All OpenStreetMap endpoints failed: ' + '; '.join(errors))
     found=[]
     for e in elements:
         tags=e.get('tags') or {}
@@ -368,21 +381,33 @@ async def setzip(interaction:discord.Interaction,zip_code:str):
     conn.execute('INSERT OR REPLACE INTO user_zips VALUES (?,?,?)',(interaction.guild_id or 0,interaction.user.id,zip_code));conn.commit()
     await interaction.response.send_message(f'ZIP set to {zip_code}. Use /findstores to look for stores in the configured directory.',ephemeral=True)
 
+async def auto_dismiss(message, delay=45):
+    """Best-effort cleanup for short-lived ephemeral follow-up messages."""
+    await asyncio.sleep(delay)
+    try:
+        await message.delete()
+    except (discord.HTTPException, AttributeError):
+        pass
+
+async def store_reply(interaction, content):
+    message = await interaction.followup.send(content, ephemeral=True, wait=True)
+    asyncio.create_task(auto_dismiss(message))
+
 @bot.tree.command(name='findstores',description='Find Walmart stores near a ZIP from the configured store directory')
 @app_commands.describe(zip_code='Optional ZIP (defaults to your saved ZIP)',radius_miles='Search radius in miles (1–100)')
 async def findstores(interaction:discord.Interaction,zip_code:str='',radius_miles:int=25):
     if not 1<=radius_miles<=100:
-        await interaction.response.send_message('Radius must be 1–100 miles.',ephemeral=True);return
+        await interaction.response.send_message('Radius must be 1–100 miles.');return
     if not zip_code:
         row=conn.execute('SELECT zip_code FROM user_zips WHERE guild_id=? AND user_id=?',(interaction.guild_id or 0,interaction.user.id)).fetchone()
         zip_code=row[0] if row else ''
     if not re.fullmatch(r'\d{5}',zip_code):
-        await interaction.response.send_message('Use /setzip first, or supply a five-digit ZIP.',ephemeral=True);return
+        await interaction.response.send_message('Use /setzip first, or supply a five-digit ZIP.');return
     await interaction.response.defer(ephemeral=True)
     try: loc=await zip_coordinates(zip_code)
     except Exception: loc=None
     if not loc:
-        await interaction.followup.send('ZIP lookup unavailable. Try again later or check ZIP_LOOKUP_ENABLED.',ephemeral=True);return
+        await store_reply(interaction, 'ZIP lookup unavailable. Try again later or check ZIP_LOOKUP_ENABLED.');return
     stores=load_store_directory()
     results=[]
     for store in stores:
@@ -392,19 +417,19 @@ async def findstores(interaction:discord.Interaction,zip_code:str='',radius_mile
     results.sort(key=lambda x:x[0])
     if results:
         lines=[f"#{r['store_id']} — {r.get('name','Walmart')} · {dist:.1f} mi · {r.get('address','')}" for dist,r in results[:15]]
-        await interaction.followup.send('Nearby stores from configured CSV (not live inventory):\n'+'\n'.join(lines)[:1700]+'\nUse /watchstore for provider-reported store prices.',ephemeral=True)
+        await store_reply(interaction, 'Nearby stores from configured CSV (not live inventory):\n'+'\n'.join(lines)[:1700]+'\nUse /watchstore for provider-reported store prices.')
         return
     try:
         found, source = await discover_osm_walmarts(*loc,radius_miles)
     except Exception:
         logging.exception('OpenStreetMap lookup failed')
-        await interaction.followup.send('Store lookup temporarily unavailable. OpenStreetMap may be rate-limiting requests. Try again later or supply an authorized store CSV.',ephemeral=True)
+        await store_reply(interaction, 'OpenStreetMap lookup failed on all configured servers. Please retry later, or configure WALMART_STORES_CSV with an authorized directory. Details are in the bot logs.')
         return
     if not found:
-        await interaction.followup.send('No Walmart locations found in available OpenStreetMap data within that radius. Results may be incomplete.',ephemeral=True)
+        await store_reply(interaction, 'No Walmart locations found in available OpenStreetMap data within that radius. Results may be incomplete.')
         return
     lines=[f'{key} — {name} · {dist:.1f} mi · {address}' for dist,key,name,address in found[:12]]
-    await interaction.followup.send(('Nearby Walmart locations (community OpenStreetMap data; NOT store numbers, prices or stock):\n'+'\n'.join(lines)+'\nUse /watchlocation with the node:/way:/relation: ID.').strip()[:1900],ephemeral=True)
+    await store_reply(interaction, ('Nearby Walmart locations (community OpenStreetMap data; NOT store numbers, prices or stock):\n'+'\n'.join(lines)+'\nUse /watchlocation with the node:/way:/relation: ID.').strip()[:1900])
 
 @bot.tree.command(name='watchlocation',description='Follow a Walmart location found using /findstores (personal watchlist)')
 @app_commands.describe(location_id='OpenStreetMap ID such as node:12345',label='Optional short label')
@@ -433,6 +458,7 @@ async def mystores(interaction:discord.Interaction):
 
 async def main():
     await bot.load_extension('gardener')
+    await bot.load_extension('roles_streams')
     if not TOKEN: raise RuntimeError('Set DISCORD_TOKEN in .env')
     async with bot:
         if GUILD_ID:

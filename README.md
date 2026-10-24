@@ -63,3 +63,41 @@ Run `pip install -r requirements.txt`, `python bot.py`, and configure these slas
 The panel's persistent **Manage My Room** and **How It Works** buttons survive restarts. Room settings support rename, user limit, public/private, allow, block, unblock, disconnect, and delete. Room ownership and config persist across restarts. Empty rooms are automatically removed when members leave. Gardener logs room creation, deletion, privacy and member-management actions to the configured channel; it is **not** a comprehensive Discord server audit-log mirror.
 
 **Deployment:** Back up `.env` and `deals.sqlite3` before updating. Keep your existing `.env` values; add `GARDENER_DATABASE_PATH` only if you want a custom path. The `gardener.py` file must be in the same directory as `bot.py`. Restart the service after replacing files. Python syntax has been checked, but live Discord permissions and interactions still require testing.
+
+## Gardener v4: Voice-chat panel and 20 Questions
+
+- Each newly created temporary voice room receives its own **Gardener control panel directly in that voice channel's text chat**. The panel's `Manage My Room` button opens ephemeral controls; only the recorded room owner may use them. The old `/gardener-setup panel` command remains available but is optional.
+- `/20questions` starts a private, interactive, offline guessing game with Yes / Probably / Not sure / Probably not / No buttons. The game uses a curated list of objects, animals, and character types; it is **not connected to Akinator** and may not guess arbitrary people or concepts. Sessions time out after ten minutes.
+- Gardener needs `View Channel`, `Send Messages`, `Embed Links`, `Manage Channels`, `Move Members`, and `Connect` in the relevant category and voice channels to post its voice-chat panel and manage rooms.
+- The voice-channel chat message is not a separate text channel. If the panel does not appear, check the bot's send-message permissions and server logs for `Could not post panel in voice chat`.
+- Preserve your `.env`, `deals.sqlite3`, `gardener.sqlite3` (or your configured database path), and any custom feeds when upgrading. Avoid running two copies of the bot simultaneously.
+
+## Gardener v6 — expanded 20 Questions knowledge base
+
+`/20questions` now reads a persistent SQLite knowledge base seeded automatically with 240+ possible answers, including video-game characters, anime characters, animals, foods, and household objects. Existing entries are preserved on restart and upgrades (`INSERT OR IGNORE`). After an incorrect final guess, enter the correct answer in the **Teach Gardener** popup to add it to future games. This is a simple trait-based guessing game, not the official Akinator service or a trained language model. A taught answer inherits only traits answered Yes/Probably during that game, so some newly learned entries may need refinement.
+
+By default, the database is created alongside `GARDENER_DATABASE_PATH` as `gardener_questions.sqlite3`. You can override it in `.env`:
+
+```dotenv
+GARDENER_QUESTIONS_DATABASE_PATH=/home/michael/dealhunter/discordbot/discordbot/data/gardener_questions.sqlite3
+```
+
+Ensure the containing directory is writable by the bot user. **Back up both SQLite databases** before updating. Do not overwrite your existing `.env`, deal database, or Gardener database. Restart the bot and try `/20questions`.
+
+## Gardener community roles and stream alerts (v7)
+
+1. Create three ordinary Discord roles named Streamer, Gamer, and Deal Watcher. Give the bot **Manage Roles** and move the bot's highest role **above** these three roles. The bot also needs Send Messages, Embed Links, and View Channel permissions in the panel and shoutout channels.
+2. Start the bot, then use `/community-setup` (Manage Server permission required). Supply the three roles, a shoutout text channel, and the panel text channel. The bot posts persistent role-selection and stream-registration controls. Members can choose any combination of roles and revisit the selector to remove them.
+3. Members select **Streamer**, then use the **Register Twitch / Kick** button to add a username. They can list accounts with **My Stream Accounts**, and remove an account with `/stream-remove`.
+4. Configure stream status credentials in `.env`:
+
+```
+TWITCH_CLIENT_ID=
+TWITCH_CLIENT_SECRET=
+KICK_ACCESS_TOKEN=
+GARDENER_COMMUNITY_DATABASE_PATH=/home/michael/dealhunter/discordbot/discordbot/data/gardener_community.sqlite3
+```
+
+Twitch requires an app registered in the [Twitch Developer Console](https://dev.twitch.tv/console) with client ID and secret. The module fetches and refreshes an app access token. Kick uses the official public API (`api.kick.com`) with a valid OAuth app access token; token provisioning/refresh is not automated. **Without the relevant credentials, that platform is not monitored and no live shoutouts will occur.** Do not put credentials in Discord chat or commit them to GitHub. Kick API response formats and permissions may evolve; check the logs if its status endpoint rejects requests.
+
+Checks run approximately every 2 minutes. One notification is sent when a registered channel changes from offline to live, and another can be sent after a subsequent offline-to-live transition. On first successful check, an already-live channel is treated as a new live transition. Accounts are self-declared, not verified as owned by the registering member; consider moderator approval before enabling in a large public server. Database files are separate from DealHunter and Gardener's existing databases. Back up all `.sqlite3` files and `.env` before upgrading. No extra dependencies beyond the existing `httpx` and `discord.py` requirements.
