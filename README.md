@@ -32,3 +32,8 @@ Populate `walmart_stores.csv` with `store_id,name,address,zip,latitude,longitude
 ## Security
 
 Do not commit `.env`, `*.sqlite3` or access tokens. RSS URLs should be trusted HTTPS sources; bot does not follow redirects. Test provider permissions and terms.
+
+## v4: category routing
+Create five Discord text channels and add their numeric IDs to `.env` as `AMAZON_DEALS_CHANNEL_ID`, `WALMART_DEALS_CHANNEL_ID`, `PRICE_ERRORS_CHANNEL_ID`, `PENNY_DEALS_CHANNEL_ID`, and `COUPON_DEALS_CHANNEL_ID`. Leave `DEALS_CHANNEL_ID` configured as the fallback. Give the bot View Channel, Send Messages and Embed Links in each. Restart the bot and run `/dealstatus` and `/dealscan`.
+
+RSS items are classified using explicit keywords in their titles/descriptions. A deal mentioning coupons or penny deals is routed to that category first. Ambiguous/unrelated items are skipped. **Keyword categories do not verify prices, inventory, retailer identity, coupon eligibility or actual pricing mistakes.** A store-specific penny deal still needs verification at the particular Walmart location. Already-posted RSS URLs remain in `rss_seen` and will not be re-posted solely because routing changed. New qualifying items will go to their new channels. The original database and watchlists are retained.

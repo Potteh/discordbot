@@ -23,6 +23,14 @@ logging.basicConfig(level=logging.INFO)
 TOKEN = os.getenv('DISCORD_TOKEN', '')
 GUILD_ID = int(os.getenv('DISCORD_GUILD_ID', '0'))
 CHANNEL_ID = int(os.getenv('DEALS_CHANNEL_ID', '0'))
+CATEGORY_CHANNELS = {
+    'amazon': int(os.getenv('AMAZON_DEALS_CHANNEL_ID', '0')),
+    'walmart': int(os.getenv('WALMART_DEALS_CHANNEL_ID', '0')),
+    'price_error': int(os.getenv('PRICE_ERRORS_CHANNEL_ID', '0')),
+    'penny': int(os.getenv('PENNY_DEALS_CHANNEL_ID', '0')),
+    'coupon': int(os.getenv('COUPON_DEALS_CHANNEL_ID', '0')),
+}
+
 INTERVAL = max(5, int(os.getenv('CHECK_MINUTES', '30')))
 THRESHOLD = Decimal(os.getenv('MIN_DISCOUNT_PERCENT', '70'))
 PENNY = Decimal(os.getenv('MAX_PENNY_PRICE', '1'))
@@ -127,11 +135,39 @@ async def zip_coordinates(zip_code):
         if not places: return None
         return float(places[0]['latitude']),float(places[0]['longitude'])
 
+def categorize_lead(title, description, link):
+    """Conservative, text-based categories; never claim price verification."""
+    text = re.sub(r'<[^>]*>', ' ', title + ' ' + description).lower()
+    host = (urlparse(link).hostname or '').lower()
+    # Link destination is often a deal community URL; use explicit merchant mentions.
+    amazon = bool(re.search(r'\bamazon\b', text)) or host in ('amazon.com','www.amazon.com')
+    walmart = bool(re.search(r'\bwalmart\b', text)) or host in ('walmart.com','www.walmart.com')
+    penny = bool(re.search(r'\bpenny\s+deal(s)?\b|\b(?:\$0\.01|1[ -]?cent)\b', text))
+    price_error = bool(re.search(r'\bprice\s+(?:error|mistake|glitch)\b|\bmisprice(?:d)?\b', text))
+    coupon = bool(re.search(r'\bcoupon(s)?\b|\bpromo\s*code\b|\bclip(?:pable)?\s+coupon\b', text))
+    if penny: return 'penny'
+    if price_error: return 'price_error'
+    if coupon: return 'coupon'
+    if amazon and not walmart: return 'amazon'
+    if walmart and not amazon: return 'walmart'
+    return None
+
+async def destination(category):
+    target_id = CATEGORY_CHANNELS.get(category, 0) or CHANNEL_ID
+    if not target_id: return None
+    try:
+        return bot.get_channel(target_id) or await bot.fetch_channel(target_id)
+    except (discord.Forbidden, discord.NotFound):
+        logging.warning('Cannot access channel for %s (%s); trying fallback', category, target_id)
+        if CHANNEL_ID and target_id != CHANNEL_ID:
+            try: return bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
+            except (discord.Forbidden, discord.NotFound): pass
+        return None
+
 async def scan_rss():
     # RSS is discovery of third-party deal *leads*, not verified price or inventory.
     # Only configured HTTPS URLs are read; no retailer scraping.
-    if not RSS_URLS or not CHANNEL_ID: return (0,0)
-    channel=bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
+    if not RSS_URLS or not (CHANNEL_ID or any(CATEGORY_CHANNELS.values())): return (0,0)
     inspected=posted=0
     async with httpx.AsyncClient(timeout=20,follow_redirects=False,headers={'User-Agent':'DealHunter/3.0 (RSS reader)'}) as client:
         for url in RSS_URLS:
@@ -155,10 +191,13 @@ async def scan_rss():
                         link=el.get('href','') if el is not None else ''
                     if not title or not link or urlparse(link).scheme!='https': continue
                     inspected+=1
-                    content=(title+' '+val('description')).lower()
-                    if not any(word in content for word in ('amazon','walmart','coupon','clearance','penny deal','price error')): continue
+                    category=categorize_lead(title,val('description'),link)
+                    if category is None: continue
                     if conn.execute('SELECT 1 FROM rss_seen WHERE url=?',(link,)).fetchone():continue
-                    embed=discord.Embed(title=title[:240],url=link,description='Community deal lead — price, stock, coupons, and store availability are **unverified**.',color=discord.Color.orange())
+                    channel = await destination(category)
+                    if channel is None: continue
+                    label={'amazon':'Amazon','walmart':'Walmart','price_error':'Possible price error','penny':'Potential penny deal','coupon':'Coupon lead'}[category]
+                    embed=discord.Embed(title=title[:240],url=link,description=f'**{label} (keyword classification)**\nCommunity deal lead — price, stock, coupons, and store availability are **unverified**.',color=discord.Color.orange())
                     embed.set_footer(text='Third-party RSS lead; verify on retailer site before purchasing. Not a confirmed price error.')
                     await channel.send(embed=embed)
                     conn.execute('INSERT OR IGNORE INTO rss_seen VALUES (?,?)',(link,datetime.now(timezone.utc).isoformat()))
@@ -172,7 +211,6 @@ bot=commands.Bot(command_prefix='!',intents=intents)
 
 async def scan():
     async with lock:
-        channel=bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
         deals=await fetch_deals()
         sent=0
         for item in deals:
@@ -207,6 +245,10 @@ async def scan():
                 embed.add_field(name='Last provider verification',value=item['verified_at'].strftime('%Y-%m-%d %H:%M UTC'))
                 embed.add_field(name='Source',value=item['source'])
             embed.set_footer(text='Provider-reported data, not independently checked by bot. In-store prices/stock and coupon eligibility can differ. Tax/shipping excluded.')
+            category = ('penny' if effective <= PENNY else 'price_error' if discount >= THRESHOLD else 'coupon')
+            if category == 'price_error' and discount < THRESHOLD: category = r
+            channel = await destination(category)
+            if channel is None: continue
             await channel.send(embed=embed)
             conn.execute('INSERT INTO alert_events VALUES (?,?,?,?,?,?,?)',key)
             if scope=='online': conn.execute('INSERT OR IGNORE INTO alerts VALUES (?,?,?,?)',(r,pid,str(price),str(coupon)))
@@ -216,7 +258,7 @@ async def scan():
 
 @tasks.loop(minutes=INTERVAL)
 async def periodic_scan():
-    if not CHANNEL_ID or not (FEED or RSS_URLS): return
+    if not (CHANNEL_ID or any(CATEGORY_CHANNELS.values())) or not (FEED or RSS_URLS): return
     try:
         n=s=0
         if FEED: n,s=await scan()
@@ -237,14 +279,14 @@ async def dealstatus(interaction:discord.Interaction):
     n=conn.execute('SELECT COUNT(*) FROM observations').fetchone()[0]
     sn=conn.execute('SELECT COUNT(*) FROM store_observations').fetchone()[0]
     watches=conn.execute('SELECT COUNT(*) FROM store_watches WHERE guild_id=?',(interaction.guild_id or 0,)).fetchone()[0]
-    await interaction.response.send_message(f'Structured feed: {bool(FEED)} | RSS sources: {len(RSS_URLS)} | Scan interval: {INTERVAL} min | Online observations: {n} | Store observations: {sn} | Watched stores: {watches} | Discount threshold: {THRESHOLD}%',ephemeral=True)
+    await interaction.response.send_message(f'Structured feed: {bool(FEED)} | RSS sources: {len(RSS_URLS)} | Routed channels: {sum(bool(x) for x in CATEGORY_CHANNELS.values())} | Scan interval: {INTERVAL} min | Online observations: {n} | Store observations: {sn} | Watched stores: {watches} | Discount threshold: {THRESHOLD}%',ephemeral=True)
 
 @bot.tree.command(name='dealscan',description='Run an immediate deal scan (Manage Server permission)')
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 async def dealscan(interaction:discord.Interaction):
-    if not (FEED or RSS_URLS) or not CHANNEL_ID:
-        await interaction.response.send_message('Configure RSS_FEED_URLS or DEAL_FEED_URL and DEALS_CHANNEL_ID first.',ephemeral=True);return
+    if not (FEED or RSS_URLS) or not (CHANNEL_ID or any(CATEGORY_CHANNELS.values())):
+        await interaction.response.send_message('Configure RSS_FEED_URLS or DEAL_FEED_URL and at least one alert channel first.',ephemeral=True);return
     await interaction.response.defer(ephemeral=True)
     try:
         n=s=0
